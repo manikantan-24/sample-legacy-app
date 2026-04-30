@@ -16,7 +16,7 @@
     "moment": "2.29.1",
     "cors": "2.8.5",
     "dotenv": "8.2.0",
-    "mongoose": "5.12.3",
+    "mongoose": "9.6.1",
     "jsonwebtoken": "8.5.1"
   },
   "devDependencies": {
