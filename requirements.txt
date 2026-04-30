@@ -7,7 +7,7 @@ celery==4.4.7
 redis==3.5.3
 boto3==1.16.63
 pydantic==1.7.3
-fastapi==0.63.0
+fastapi==0.136.1
 uvicorn==0.13.3
 pillow==8.1.0
 cryptography==3.3.2
