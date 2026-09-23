@@ -1,0 +1,5 @@
+com/example/legacy/User.class
+com/example/legacy/UserController.class
+com/example/legacy/SecurityConfig.class
+com/example/legacy/LegacyApplication.class
+com/example/legacy/UserRepository.class
