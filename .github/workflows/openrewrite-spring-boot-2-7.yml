@@ -33,8 +33,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          count=$(gh api "repos/${GITHUB_REPOSITORY}/dependabot/alerts?state=open&severity=critical,high&per_page=100" \
-            --jq '[.[] | select(.dependency.package.ecosystem == "maven")] | length' 2>/dev/null || echo 0)
+          # gh api's error body on a non-2xx response goes to stdout, not just stderr, and
+          # exits non-zero — so `2>/dev/null || echo 0` alone doesn't work: the failed
+          # command's stdout gets captured *and* "0" gets appended after it. Check success
+          # explicitly instead of relying on the exit code inside a substitution.
+          if raw=$(gh api "repos/${GITHUB_REPOSITORY}/dependabot/alerts?state=open&severity=critical,high&per_page=100" \
+            --jq '[.[] | select(.dependency.package.ecosystem == "maven")] | length' 2>/dev/null); then
+            count="$raw"
+          else
+            count=0
+          fi
           echo "critical_high_count=${count:-0}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/setup-java@v4
