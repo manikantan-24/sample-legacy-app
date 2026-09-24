@@ -60,25 +60,77 @@ jobs:
         run: |
           # Embedded rather than fetched from tech-stack-advisor's own repo — that
           # project isn't (yet) a pushed, fetchable GitHub repo itself. Keep this in
-          # sync with agent_pipeline/transforms/express_v5.js by hand if it changes;
-          # same file, same rule (app.del()/router.del() -> .delete(), removed
-          # entirely in Express 5 — https://expressjs.com/en/guide/migrating-5.html).
+          # sync with agent_pipeline/transforms/express_v5.js by hand if it changes.
+          # Four rules, each verified against expressjs.com/en/guide/migrating-5.html —
+          # see that file's own header comment for the full rationale per rule.
           cat > /tmp/express_v5.js <<'TRANSFORM_EOF'
           module.exports = function transformer(file, api) {
             const j = api.jscodeshift;
             const root = j(file.source);
             let count = 0;
+            const RES_NAMES = /^(res|response)$/i;
+            const APP_NAMES = /^(app|router)$/i;
+            const ROUTE_METHODS = ['get', 'post', 'put', 'delete', 'patch', 'all', 'use'];
+
+            // Rule 1: app.del()/router.del() -> .delete()
             root
               .find(j.CallExpression, {
                 callee: { type: 'MemberExpression', property: { name: 'del' } },
               })
               .forEach(path => {
                 const objName = path.node.callee.object.name;
-                if (objName && /^(app|router)$/i.test(objName)) {
+                if (objName && APP_NAMES.test(objName)) {
                   path.node.callee.property.name = 'delete';
                   count++;
                 }
               });
+
+            // Rule 2: res.sendfile() -> res.sendFile()
+            root
+              .find(j.CallExpression, {
+                callee: { type: 'MemberExpression', property: { name: 'sendfile' } },
+              })
+              .forEach(path => {
+                const objName = path.node.callee.object.name;
+                if (objName && RES_NAMES.test(objName)) {
+                  path.node.callee.property.name = 'sendFile';
+                  count++;
+                }
+              });
+
+            // Rule 3: res.redirect(url, status) -> res.redirect(status, url), literal-only
+            root
+              .find(j.CallExpression, {
+                callee: { type: 'MemberExpression', property: { name: 'redirect' } },
+              })
+              .forEach(path => {
+                const objName = path.node.callee.object.name;
+                const args = path.node.arguments;
+                if (!objName || !RES_NAMES.test(objName) || args.length !== 2) return;
+                const [a, b] = args;
+                const aIsStringLiteral = (a.type === 'Literal' || a.type === 'StringLiteral') && typeof a.value === 'string';
+                const bIsNumberLiteral = (b.type === 'Literal' || b.type === 'NumericLiteral') && typeof b.value === 'number';
+                if (aIsStringLiteral && bIsNumberLiteral) {
+                  path.node.arguments = [b, a];
+                  count++;
+                }
+              });
+
+            // Rule 4: wildcard route strings '/*' -> '/*splat'
+            root
+              .find(j.CallExpression, { callee: { type: 'MemberExpression' } })
+              .forEach(path => {
+                const objName = path.node.callee.object.name;
+                const methodName = path.node.callee.property.name;
+                if (!objName || !APP_NAMES.test(objName) || !ROUTE_METHODS.includes(methodName)) return;
+                const first = path.node.arguments[0];
+                const isStringLiteral = first && (first.type === 'Literal' || first.type === 'StringLiteral') && typeof first.value === 'string';
+                if (isStringLiteral && /\/\*$/.test(first.value) && !first.value.endsWith('*splat')) {
+                  first.value = first.value.replace(/\*$/, '*splat');
+                  count++;
+                }
+              });
+
             if (count > 0) console.error(`RENAME_COUNT:${count} in ${file.path}`);
             if (count === 0) return null;
             return root.toSource();
@@ -124,20 +176,28 @@ jobs:
           token: ${{ secrets.OPENREWRITE_PR_TOKEN }}   # same PAT reused across every AST-tool workflow — see SPEC.md 3.9; the anti-recursion issue is identical no matter which tool produced the PR
           commit-message: "chore(jscodeshift): rename app.del()/router.del() to .delete()"
           branch: jscodeshift/express-4-to-5
-          title: "chore: migrate app.del()/router.del() to .delete() (Express 5, jscodeshift)"
+          title: "chore: migrate Express 4 -> 5 breaking API changes (jscodeshift)"
           draft: true
           labels: jscodeshift, major-upgrade, dependencies
           body: |
             Automated via a jscodeshift transform (mirrors `agent_pipeline/transforms/express_v5.js`
-            in tech-stack-advisor). Renames the `app.del()`/`router.del()` alias that Express 5
-            removes entirely.
+            in tech-stack-advisor). Applies four verified Express 5 breaking-change rules where a
+            safe, unambiguous rewrite exists:
+            - `app.del()`/`router.del()` -> `.delete()` (alias removed entirely)
+            - `res.sendfile()` -> `res.sendFile()` (camelCased)
+            - `res.redirect(url, status)` -> `res.redirect(status, url)` — **literal-only**: only
+              rewritten when the URL is a string literal and the status a numeric literal; calls
+              using variables for either argument are left untouched rather than guessed
+            - Wildcard route strings `'/*'` -> `'/*splat'` (path-to-regexp v6+ requires named wildcards)
 
             🛑 Open critical/high Dependabot alerts on this ecosystem right now: ${{ steps.alerts.outputs.critical_high_count }} — this PR may resolve some of them; check the Security tab after merging.
 
             **Do not merge without:**
             - [ ] Waiting for this repo's normal CI to run on this PR (uses a PAT so checks trigger correctly)
-            - [ ] Also bumping the `express` dependency itself to `^5.0.0` in `package.json` — this PR only rewrites the code pattern, not the version pin
-            - [ ] Reviewing other Express 5 breaking changes this narrow rule doesn't cover (route path wildcard syntax, removed `res.redirect(url, status)` argument order, etc. — see expressjs.com/en/guide/migrating-5.html)
+            - [ ] Also bumping the `express` dependency itself to `^5.0.0` in `package.json` — this PR only rewrites code patterns, not the version pin
+            - [ ] Manually reviewing every `req.param(name)` call — removed entirely in Express 5, and which explicit source (`req.params`/`req.body`/`req.query`) each call should become can't be inferred automatically without risking silently-wrong code
+            - [ ] Checking for any `res.redirect()`/`res.send()`/`res.json()` calls using variables (not literals) for status codes — the literal-only rules above intentionally skip these
+            - [ ] Reviewing the full breaking-change list at expressjs.com/en/guide/migrating-5.html for anything else not covered by these four rules
 
       - name: Notify Slack (no-op if webhook secret is not set)
         if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'

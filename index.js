@@ -12,6 +12,21 @@ app.del('/items/:id', (req, res) => {
   res.status(204).end();
 });
 
+// res.sendfile() (lowercase f) is camelCased to res.sendFile() in Express 5.
+app.get('/download', (req, res) => {
+  res.sendfile('/public/manual.pdf');
+});
+
+// Express 5 flips res.redirect()'s argument order: status comes first.
+app.get('/old-login', (req, res) => {
+  res.redirect('/login', 301);
+});
+
+// Express 5 (path-to-regexp v6+) requires named wildcards.
+app.get('/files/*', (req, res) => {
+  res.send('serving a file');
+});
+
 app.listen(3000, () => {
   console.log('Server running on port 3000');
 });
