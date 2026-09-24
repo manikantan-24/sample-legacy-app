@@ -1,0 +1,176 @@
+name: jscodeshift - AWS CDK v1 to v2
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      WORKING_DIRECTORY:
+        description: 'Subdirectory containing package.json (monorepo support)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+  vulnerability-alerts: read
+
+env:
+  BRANCH: jscodeshift/cdk-v1-to-v2
+
+jobs:
+  rewrite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip if a PR from a previous run is still open
+        id: existing_pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
+          echo "open_pr_count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Check for related open Dependabot alerts
+        id: alerts
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if raw=$(gh api "repos/${GITHUB_REPOSITORY}/dependabot/alerts?state=open&severity=critical,high&per_page=100" \
+            --jq '[.[] | select(.dependency.package.ecosystem == "npm")] | length' 2>/dev/null); then
+            count="$raw"
+          else
+            count=0
+          fi
+          echo "critical_high_count=${count:-0}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        with:
+          node-version: "20"
+
+      - name: Write the jscodeshift transform
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        run: |
+          # Embedded, same reason and same caveat as jscodeshift-express-4-to-5.yml:
+          # keep this in sync by hand with agent_pipeline/transforms/cdk_v2.js.
+          # Rewrites @aws-cdk/core -> aws-cdk-lib and @aws-cdk/aws-* ->
+          # aws-cdk-lib/aws-* (CDK v1's per-service packages consolidated into one
+          # package in v2). Deliberately narrow — packages renamed outright rather
+          # than just relocated (e.g. @aws-cdk/assert -> @aws-cdk/assertions) are
+          # out of scope for this rule.
+          cat > /tmp/cdk_v2.js <<'TRANSFORM_EOF'
+          module.exports = function transformer(file, api) {
+            const j = api.jscodeshift;
+            const root = j(file.source);
+            let count = 0;
+
+            function rewriteSource(value) {
+              if (value === '@aws-cdk/core') return 'aws-cdk-lib';
+              const m = /^@aws-cdk\/(aws-[\w-]+)$/.exec(value);
+              if (m) return `aws-cdk-lib/${m[1]}`;
+              return null;
+            }
+
+            root.find(j.ImportDeclaration).forEach(path => {
+              const newSource = rewriteSource(path.node.source.value);
+              if (newSource) {
+                path.node.source = j.literal(newSource);
+                count++;
+              }
+            });
+
+            root.find(j.CallExpression, { callee: { name: 'require' } }).forEach(path => {
+              const arg = path.node.arguments[0];
+              if (arg && (arg.type === 'Literal' || arg.type === 'StringLiteral') && typeof arg.value === 'string') {
+                const newSource = rewriteSource(arg.value);
+                if (newSource) {
+                  path.node.arguments[0] = j.literal(newSource);
+                  count++;
+                }
+              }
+            });
+
+            if (count > 0) console.error(`RENAME_COUNT:${count} in ${file.path}`);
+            if (count === 0) return null;
+            return root.toSource();
+          };
+          TRANSFORM_EOF
+
+      - name: Run jscodeshift transform
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        working-directory: ${{ github.event.inputs.WORKING_DIRECTORY || '.' }}
+        run: |
+          npx --yes jscodeshift -t /tmp/cdk_v2.js \
+            --extensions=js,jsx,ts,tsx --parser=tsx \
+            --ignore-pattern='**/node_modules/**' .
+
+      - name: Check for changes
+        id: diff
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sanity-check TypeScript (full verification happens via this repo's normal CI on the PR)
+        if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
+        working-directory: ${{ github.event.inputs.WORKING_DIRECTORY || '.' }}
+        run: |
+          # Only if the repo actually has a tsconfig — a real type-check needs the
+          # project's own dependencies installed (npm ci), which is skipped here
+          # deliberately (same "sanity, not full verify" split as every other
+          # workflow in this family) unless a tsconfig signals it's worth trying.
+          if [ -f tsconfig.json ]; then
+            npm ci --no-audit --no-fund || true
+            # --package=typescript is required: plain `npx tsc` resolves to an
+            # unrelated decoy package literally named `tsc` on npm, not the real
+            # compiler (package name `typescript`, bin name `tsc`) — confirmed live,
+            # `npx --yes tsc --version` prints a "wrong command" banner instead of
+            # a version number.
+            npx --yes --package=typescript tsc --noEmit || echo "::warning::tsc reported errors — this PR still needs the package.json cleanup noted in the PR body before it will actually compile."
+          else
+            echo "No tsconfig.json found — skipping tsc sanity check."
+          fi
+
+      - name: Open draft PR
+        if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.OPENREWRITE_PR_TOKEN }}
+          commit-message: "chore(jscodeshift): rewrite @aws-cdk/* imports to aws-cdk-lib (CDK v2)"
+          branch: jscodeshift/cdk-v1-to-v2
+          title: "chore: migrate CDK v1 imports to aws-cdk-lib (CDK v2, jscodeshift)"
+          draft: true
+          labels: jscodeshift, major-upgrade, dependencies
+          body: |
+            Automated via a jscodeshift transform (mirrors `agent_pipeline/transforms/cdk_v2.js`
+            in tech-stack-advisor). Rewrites `@aws-cdk/core` -> `aws-cdk-lib` and every
+            `@aws-cdk/aws-*` -> `aws-cdk-lib/aws-*` import/require.
+
+            🛑 Open critical/high Dependabot alerts on this ecosystem right now: ${{ steps.alerts.outputs.critical_high_count }}
+
+            **This PR does NOT yet fix `package.json`** — CDK v2 is a package swap, not a
+            version bump on the same package name, so this only rewrites the *code* that
+            would otherwise break. Before merging:
+            - [ ] Remove every `@aws-cdk/*` entry from `package.json` and add `aws-cdk-lib` + `constructs`
+            - [ ] Run `npm install` and confirm the lockfile updates cleanly
+            - [ ] Waiting for this repo's normal CI to run on this PR (uses a PAT so checks trigger correctly)
+            - [ ] Reviewing the official CDK v2 migration guide for anything this narrow import-path rule doesn't cover (renamed packages like `@aws-cdk/assert` -> `@aws-cdk/assertions`, deprecated API removals, etc.)
+
+      - name: Notify Slack (no-op if webhook secret is not set)
+        if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ] && [ -n "$PR_URL" ]; then
+            curl -fsS -X POST -H 'Content-type: application/json' \
+              --data "{\"text\":\"jscodeshift opened a draft PR: $PR_URL\"}" \
+              "$SLACK_WEBHOOK_URL"
+          fi

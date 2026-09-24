@@ -1,0 +1,152 @@
+name: jscodeshift - Express 4 to 5
+
+on:
+  schedule:
+    - cron: "0 4 * * 1"   # weekly, offset an hour from the OpenRewrite workflows' 03:00 slot
+  workflow_dispatch:
+    inputs:
+      WORKING_DIRECTORY:
+        description: 'Subdirectory containing package.json (monorepo support)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+  vulnerability-alerts: read   # to check for related open Dependabot alerts, below
+
+env:
+  BRANCH: jscodeshift/express-4-to-5
+
+jobs:
+  rewrite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip if a PR from a previous run is still open
+        id: existing_pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
+          echo "open_pr_count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Check for related open Dependabot alerts
+        id: alerts
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # See tech-stack-advisor SPEC.md 3.19/3.18 for why this checks success
+          # explicitly rather than `2>/dev/null || echo 0` — gh api's error body
+          # on a non-2xx response goes to stdout too, so the naive form silently
+          # garbles this into "right now: {...}0" instead of a clean "0".
+          if raw=$(gh api "repos/${GITHUB_REPOSITORY}/dependabot/alerts?state=open&severity=critical,high&per_page=100" \
+            --jq '[.[] | select(.dependency.package.ecosystem == "npm")] | length' 2>/dev/null); then
+            count="$raw"
+          else
+            count=0
+          fi
+          echo "critical_high_count=${count:-0}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        with:
+          node-version: "20"
+
+      - name: Write the jscodeshift transform
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        run: |
+          # Embedded rather than fetched from tech-stack-advisor's own repo — that
+          # project isn't (yet) a pushed, fetchable GitHub repo itself. Keep this in
+          # sync with agent_pipeline/transforms/express_v5.js by hand if it changes;
+          # same file, same rule (app.del()/router.del() -> .delete(), removed
+          # entirely in Express 5 — https://expressjs.com/en/guide/migrating-5.html).
+          cat > /tmp/express_v5.js <<'TRANSFORM_EOF'
+          module.exports = function transformer(file, api) {
+            const j = api.jscodeshift;
+            const root = j(file.source);
+            let count = 0;
+            root
+              .find(j.CallExpression, {
+                callee: { type: 'MemberExpression', property: { name: 'del' } },
+              })
+              .forEach(path => {
+                const objName = path.node.callee.object.name;
+                if (objName && /^(app|router)$/i.test(objName)) {
+                  path.node.callee.property.name = 'delete';
+                  count++;
+                }
+              });
+            if (count > 0) console.error(`RENAME_COUNT:${count} in ${file.path}`);
+            if (count === 0) return null;
+            return root.toSource();
+          };
+          TRANSFORM_EOF
+
+      - name: Run jscodeshift transform
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        working-directory: ${{ github.event.inputs.WORKING_DIRECTORY || '.' }}
+        run: |
+          npx --yes jscodeshift -t /tmp/express_v5.js \
+            --extensions=js,jsx,ts,tsx --parser=tsx \
+            --ignore-pattern='**/node_modules/**' .
+
+      - name: Check for changes
+        id: diff
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sanity-check syntax (full verification happens via this repo's normal CI on the PR)
+        if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
+        working-directory: ${{ github.event.inputs.WORKING_DIRECTORY || '.' }}
+        run: |
+          # node --check can't parse TypeScript syntax — only sanity-checks the
+          # plain-JS files this rule touched. TS files get the same rewrite but
+          # rely on the repo's own tsc/CI for real verification (same "sanity
+          # here, real verification via the repo's real CI" split as Part B).
+          changed_js=$(git diff --name-only -- '*.js' '*.jsx' || true)
+          for f in $changed_js; do
+            node --check "$f"
+          done
+
+      - name: Open draft PR
+        if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.OPENREWRITE_PR_TOKEN }}   # same PAT reused across every AST-tool workflow — see SPEC.md 3.9; the anti-recursion issue is identical no matter which tool produced the PR
+          commit-message: "chore(jscodeshift): rename app.del()/router.del() to .delete()"
+          branch: jscodeshift/express-4-to-5
+          title: "chore: migrate app.del()/router.del() to .delete() (Express 5, jscodeshift)"
+          draft: true
+          labels: jscodeshift, major-upgrade, dependencies
+          body: |
+            Automated via a jscodeshift transform (mirrors `agent_pipeline/transforms/express_v5.js`
+            in tech-stack-advisor). Renames the `app.del()`/`router.del()` alias that Express 5
+            removes entirely.
+
+            🛑 Open critical/high Dependabot alerts on this ecosystem right now: ${{ steps.alerts.outputs.critical_high_count }} — this PR may resolve some of them; check the Security tab after merging.
+
+            **Do not merge without:**
+            - [ ] Waiting for this repo's normal CI to run on this PR (uses a PAT so checks trigger correctly)
+            - [ ] Also bumping the `express` dependency itself to `^5.0.0` in `package.json` — this PR only rewrites the code pattern, not the version pin
+            - [ ] Reviewing other Express 5 breaking changes this narrow rule doesn't cover (route path wildcard syntax, removed `res.redirect(url, status)` argument order, etc. — see expressjs.com/en/guide/migrating-5.html)
+
+      - name: Notify Slack (no-op if webhook secret is not set)
+        if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ] && [ -n "$PR_URL" ]; then
+            curl -fsS -X POST -H 'Content-type: application/json' \
+              --data "{\"text\":\"jscodeshift opened a draft PR: $PR_URL\"}" \
+              "$SLACK_WEBHOOK_URL"
+          fi
