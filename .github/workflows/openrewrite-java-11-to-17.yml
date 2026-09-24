@@ -1,0 +1,127 @@
+name: OpenRewrite - Upgrade Java 11 to 17
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      WORKING_DIRECTORY:
+        description: 'Subdirectory containing the Maven/Gradle project (monorepo support)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+  pull-requests: write
+  vulnerability-alerts: read   # to check for related open Dependabot alerts, below
+
+env:
+  BRANCH: rewrite/java-11-to-17
+
+jobs:
+  rewrite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skip if a PR from a previous run is still open
+        id: existing_pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          count=$(gh pr list --head "$BRANCH" --state open --json number --jq 'length')
+          echo "open_pr_count=$count" >> "$GITHUB_OUTPUT"
+
+      - name: Check for related open Dependabot alerts
+        id: alerts
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # gh api's error body on a non-2xx response goes to stdout, not just stderr, and
+          # exits non-zero — so `2>/dev/null || echo 0` alone doesn't work: the failed
+          # command's stdout gets captured *and* "0" gets appended after it. Check success
+          # explicitly instead of relying on the exit code inside a substitution.
+          if raw=$(gh api "repos/${GITHUB_REPOSITORY}/dependabot/alerts?state=open&severity=critical,high&per_page=100" \
+            --jq '[.[] | select(.dependency.package.ecosystem == "maven")] | length' 2>/dev/null); then
+            count="$raw"
+          else
+            count=0
+          fi
+          echo "critical_high_count=${count:-0}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v4
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Run OpenRewrite recipe
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        working-directory: ${{ github.event.inputs.WORKING_DIRECTORY || 'java-service' }}
+        run: |
+          mvn -B org.openrewrite.maven:rewrite-maven-plugin:6.12.0:run \
+            -Drewrite.activeRecipes=org.openrewrite.java.migrate.UpgradeToJava17 \
+            -Drewrite.recipeArtifactCoordinates=org.openrewrite.recipe:rewrite-migrate-java:3.12.0 \
+            -Drewrite.exportDatatables=true
+
+      - name: Check for changes
+        id: diff
+        if: steps.existing_pr.outputs.open_pr_count == '0'
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Sanity-check compile (full verification happens via this repo's normal CI on the PR)
+        if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
+        working-directory: ${{ github.event.inputs.WORKING_DIRECTORY || 'java-service' }}
+        run: mvn -B -q compile
+
+      - name: Upload OpenRewrite report
+        if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rewrite-datatables-java-11-to-17
+          path: ${{ github.event.inputs.WORKING_DIRECTORY || 'java-service' }}/target/rewrite/**
+
+      - name: Open draft PR
+        if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
+        id: cpr
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.OPENREWRITE_PR_TOKEN }}
+          commit-message: "chore(rewrite): apply UpgradeToJava17"
+          branch: rewrite/java-11-to-17
+          title: "chore: upgrade Java 11 to Java 17 (OpenRewrite)"
+          draft: true
+          labels: openrewrite, major-upgrade, dependencies
+          # No reviewers/team-reviewers: this is a personal account (no teams), and the
+          # PR is authored as the same account the OPENREWRITE_PR_TOKEN belongs to —
+          # GitHub rejects requesting a review from the PR's own author.
+          body: |
+            Automated via OpenRewrite recipe `org.openrewrite.java.migrate.UpgradeToJava17`.
+            
+            🛑 Open critical/high Dependabot alerts on this ecosystem right now: ${{ steps.alerts.outputs.critical_high_count }} — this PR may resolve some of them; check the Security tab after merging.
+            Note: Spring Boot 3.x requires Java 17+, so this recipe is often a prerequisite
+            for `openrewrite-spring-boot-3-0.yml` rather than an independent upgrade.
+
+            **Do not merge without:**
+            - [ ] Waiting for this repo's normal CI to run on this PR (uses a PAT so checks trigger correctly)
+            - [ ] Confirming CI/CD and container base images are updated to JDK 17
+            - [ ] Checking the uploaded `rewrite-datatables` artifact for a full list of applied changes
+
+      - name: Notify Slack (no-op if webhook secret is not set)
+        if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PR_URL: ${{ steps.cpr.outputs.pull-request-url }}
+        run: |
+          if [ -n "$SLACK_WEBHOOK_URL" ] && [ -n "$PR_URL" ]; then
+            curl -fsS -X POST -H 'Content-type: application/json' \
+              --data "{\"text\":\"OpenRewrite opened a draft PR: $PR_URL\"}" \
+              "$SLACK_WEBHOOK_URL"
+          fi
