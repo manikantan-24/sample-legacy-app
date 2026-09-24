@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!--
+    Deliberately references sample-legacy-app-parent-pom (a separate,
+    real GitHub repo) as its Maven <parent> — fixture for
+    tech-stack-advisor's internal-parent-POM cross-link detection
+    (impact_analyzer.py's internal_repo_dependencies / is_parent_pom).
+    Scan sample-legacy-app together with sample-legacy-app-parent-pom in
+    the same batch to see it fire.
+  -->
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>sample-legacy-app-parent-pom</artifactId>
+    <version>1.4.0</version>
+    <relativePath/>
+  </parent>
+
+  <artifactId>internal-consumer-service</artifactId>
+  <description>Demo fixture module — consumes the internal parent-POM fixture repo, sample-legacy-app-parent-pom.</description>
+
+  <properties>
+    <maven.compiler.source>11</maven.compiler.source>
+    <maven.compiler.target>11</maven.compiler.target>
+  </properties>
+</project>
