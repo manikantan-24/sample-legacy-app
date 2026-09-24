@@ -1,0 +1,101 @@
+// Jenkinsfile — synthetic Bento/Jenkins deployment pipeline fixture
+// Path suggestion: sample-legacy-app/java-service/Jenkinsfile
+// Paired with: sample-legacy-app/java-service/pom.xml (Spring Boot 2.6.7, per the existing fixture)
+//
+// Purpose: gives a Groovy-ecosystem parser a real, parseable "dependency" surface —
+// the JDK/Maven tool pins and the Docker base image tag below are the Jenkins-pipeline
+// equivalent of a pom.xml <properties> block, and they deliberately match this repo's
+// current Spring Boot 2.6.7 baseline (Java 11) so the fixture is internally consistent
+// with java-service/pom.xml rather than an arbitrary, unrelated version.
+//
+// This is a synthetic sample built for the prototype — not copied from any real
+// application's pipeline.
+
+@Library('pace-shared-pipeline@1.8.2') _   // shared library version pin — same "dependency" shape as a pom.xml import
+
+pipeline {
+    agent any
+
+    tools {
+        maven 'Maven-3.6.3'
+        jdk 'Temurin-11'              // <- matches java-service's current Spring Boot 2.6.7 baseline.
+                                        //    Must move to 'Temurin-17' in lockstep with the
+                                        //    Spring Boot 3.0 recipe (see openrewrite-spring-boot-3-0.yml) —
+                                        //    Spring Boot 3.x requires Java 17+.
+    }
+
+    environment {
+        DOCKER_BASE_IMAGE      = 'openjdk:11-jre-slim'   // <- same lockstep requirement as the JDK tool pin above
+        TOMCAT_MOUNTPOINT_VER  = '8.5.85'                // <- must move to 10.1.x with the Spring Boot 3.0 recipe;
+                                                           //    missing this update is the exact "silent 404" landmine
+                                                           //    documented in the tech-stack-upgrade norms.
+        ARTIFACT_REPO          = 'artifactory.example.com/team-releases'
+        SPRING_PROFILES_ACTIVE = 'int5'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+
+        stage('Build') {
+            steps { sh 'mvn -B clean package -pl api,database' }   // matches java-service's <modules>api, database</modules>
+        }
+
+        stage('Unit Tests') {
+            steps { sh 'mvn -B test' }
+            post { always { junit '**/target/surefire-reports/*.xml' } }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh """
+                    docker build \
+                      --build-arg BASE_IMAGE=${DOCKER_BASE_IMAGE} \
+                      --build-arg TOMCAT_VERSION=${TOMCAT_MOUNTPOINT_VER} \
+                      -t ${ARTIFACT_REPO}/${env.JOB_NAME}:${env.BUILD_NUMBER} .
+                """
+            }
+        }
+
+        stage('Deploy to INT5') {
+            steps {
+                // See deployment/DeployInt5.groovy — this is where auto- vs manual-promotion
+                // to the next environment is actually configured.
+                script {
+                    load 'deployment/DeployInt5.groovy'
+                }
+            }
+        }
+
+        stage('Approval Gate: INT5 -> UAT') {
+            steps {
+                input message: 'Promote INT5 build to UAT?', ok: 'Promote'
+            }
+        }
+
+        stage('Deploy to UAT') {
+            steps {
+                deployTo(environment: 'uat', configurator: 'ManualDownstreamConfigurator')
+            }
+        }
+
+        stage('Approval Gate: UAT -> PROD') {
+            steps {
+                input message: 'Promote UAT build to PROD?', ok: 'Promote'
+            }
+        }
+
+        stage('Deploy to PROD') {
+            steps {
+                deployTo(environment: 'prod', configurator: 'ManualDownstreamConfigurator')
+            }
+        }
+    }
+
+    post {
+        failure {
+            slackSend(channel: '#deploy-alerts', message: "Pipeline failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}")
+        }
+    }
+}
