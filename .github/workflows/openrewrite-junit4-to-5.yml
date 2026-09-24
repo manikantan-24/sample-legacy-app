@@ -88,6 +88,110 @@ jobs:
           name: rewrite-datatables-junit4-to-5
           path: java-service/target/rewrite/**
 
+      - name: Detect real current version, resolve CODEOWNERS, build enrichment notes
+        id: enrichment
+        if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
+        run: |
+          # Embedded, self-contained for the same reason the jscodeshift transforms
+          # are embedded elsewhere in this project: tech-stack-advisor isn't (yet) a
+          # pushed, fetchable GitHub repo. Keep in sync by hand with
+          # scripts/pr_enrichment.py + enterprise_pr_rules.py if either changes.
+          cat > /tmp/pr_enrichment.py <<'ENRICH_EOF'
+          import re
+          from pathlib import Path
+
+          COOKBOOK_DEPENDENCY_PATTERNS: list[str] = []
+          COOKBOOK_WARNING = (
+              "\u26a0\ufe0f **Cookbook-server compatibility** \u2014 this repo depends on the internal cookbook "
+              "client. Verify cookbook version compatibility and check for auto-registered filters "
+              "(e.g. a proxy-header filter) that can silently 404 requests behind the gateway."
+          )
+          DOCKER_MOUNTPOINT_FILES: list[str] = ["Docker.aws.json.erb"]
+          DOCKER_MOUNTPOINT_WARNING = (
+              "\u26a0\ufe0f **Docker/Tomcat mountpoint** \u2014 this repo has a `{filename}` config. Confirm its "
+              "Tomcat mountpoint version was bumped to match this upgrade's base image/JDK target \u2014 "
+              "a missed mountpoint means Tomcat silently ignores the newer servlet descriptor and "
+              "every URL 404s with no obvious cause."
+          )
+
+          working_dir = "java-service"
+
+          def detect_current_version():
+              pom = Path(working_dir) / 'pom.xml'
+              if not pom.exists():
+                  return 'unknown'
+              content = pom.read_text(errors='replace')
+              lines = content.splitlines()
+              found = False
+              for line in lines:
+                  if 'junit'.lower() in line.lower():
+                      found = True
+                  if found and '<version>' in line:
+                      m = re.search(r'<version>([^<]+)</version>', line)
+                      if m:
+                          return m.group(1).strip()
+              return 'unknown'
+
+          def resolve_reviewers() -> tuple[list[str], list[str]]:
+              content = None
+              for candidate in ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"):
+                  p = Path(candidate)
+                  if p.exists():
+                      content = p.read_text(errors="replace")
+                      break
+              if not content:
+                  return [], []
+              changed_path = f"{working_dir}/pom.xml"
+              matched: list[str] = []
+              for line in content.splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split()
+                  if len(parts) < 2:
+                      continue
+                  pattern, owners = parts[0], parts[1:]
+                  if pattern == "*":
+                      matched = owners
+                  elif pattern.startswith("*.") and changed_path.endswith(pattern[1:]):
+                      matched = owners
+                  elif changed_path == pattern.lstrip("/") or changed_path.startswith(pattern.lstrip("/").rstrip("/") + "/"):
+                      matched = owners
+              reviewers, team_reviewers = [], []
+              for handle in matched:
+                  h = handle.lstrip("@")
+                  if "/" in h:
+                      team_reviewers.append(h.split("/", 1)[1])
+                  else:
+                      reviewers.append(h)
+              return reviewers, team_reviewers
+
+          def enrichment_body() -> str:
+              notes = []
+              if COOKBOOK_DEPENDENCY_PATTERNS:
+                  pom = Path(working_dir) / "pom.xml"
+                  if pom.exists() and any(p.lower() in pom.read_text(errors="replace").lower() for p in COOKBOOK_DEPENDENCY_PATTERNS):
+                      notes.append(COOKBOOK_WARNING)
+              for filename in DOCKER_MOUNTPOINT_FILES:
+                  if (Path(working_dir) / filename).exists() or Path(filename).exists():
+                      notes.append(DOCKER_MOUNTPOINT_WARNING.format(filename=filename))
+                      break
+              notes.append("- [ ] Endpoint-by-endpoint Postman validation through every gateway this service sits behind, before and after \u2014 not just \"CI passed\".")
+              return "\n\n".join(notes)
+
+          current_version = detect_current_version()
+          reviewers, team_reviewers = resolve_reviewers()
+          body = enrichment_body()
+
+          import os
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"current_version={current_version}\n")
+              f.write(f"reviewers={','.join(reviewers)}\n")
+              f.write(f"team_reviewers={','.join(team_reviewers)}\n")
+              f.write(f"enrichment_body<<PR_ENRICHMENT_EOF\n{body}\nPR_ENRICHMENT_EOF\n")
+          ENRICH_EOF
+          python3 /tmp/pr_enrichment.py
+
       - name: Open draft PR
         if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
         id: cpr
@@ -96,12 +200,14 @@ jobs:
           token: ${{ secrets.OPENREWRITE_PR_TOKEN }}
           commit-message: "chore(rewrite): apply JUnit5BestPractices"
           branch: rewrite/junit4-to-5
-          title: "chore: migrate JUnit 4 tests to JUnit 5 (OpenRewrite)"
+          title: "chore: migrate ${{ github.event.repository.name }} JUnit ${{ steps.enrichment.outputs.current_version }} tests to JUnit 5 (OpenRewrite)"
           draft: true
           labels: openrewrite, major-upgrade, testing
-          # No reviewers/team-reviewers: this is a personal account (no teams), and the
-          # PR is authored as the same account the OPENREWRITE_PR_TOKEN belongs to —
-          # GitHub rejects requesting a review from the PR's own author.
+          # Resolved from this repo's own real CODEOWNERS (see the enrichment step
+          # above) instead of a REPLACE_WITH_REVIEWER_HANDLE placeholder. Empty
+          # strings are fine — the action just requests no one, same as before.
+          reviewers: ${{ steps.enrichment.outputs.reviewers }}
+          team-reviewers: ${{ steps.enrichment.outputs.team_reviewers }}
           body: |
             Automated via OpenRewrite recipe `org.openrewrite.java.testing.junit5.JUnit5BestPractices`.
             
@@ -113,6 +219,10 @@ jobs:
             - [ ] Waiting for this repo's normal CI to run on this PR (uses a PAT so checks trigger correctly)
             - [ ] Spot-checking a few converted test classes for correct assertion/annotation mapping
             - [ ] Checking the uploaded `rewrite-datatables` artifact for a full list of applied changes
+
+            ## 🏢 Enterprise Context
+
+            ${{ steps.enrichment.outputs.enrichment_body }}
 
       - name: Notify Slack (no-op if webhook secret is not set)
         if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'

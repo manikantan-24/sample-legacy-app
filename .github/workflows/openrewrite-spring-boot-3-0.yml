@@ -88,6 +88,120 @@ jobs:
           name: rewrite-datatables-spring-boot-3-0
           path: java-service/target/rewrite/**
 
+      - name: Detect real current version, resolve CODEOWNERS, build enrichment notes
+        id: enrichment
+        if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
+        run: |
+          # Embedded, self-contained (enterprise_pr_rules' constants inlined
+          # rather than imported) for the same reason the jscodeshift
+          # transforms are embedded elsewhere in this project: tech-stack-advisor
+          # isn't (yet) a pushed, fetchable GitHub repo. Keep this in sync by
+          # hand with scripts/pr_enrichment.py + enterprise_pr_rules.py if
+          # either changes.
+          cat > /tmp/pr_enrichment.py <<'ENRICH_EOF'
+          import re
+          from pathlib import Path
+
+          # --- enterprise_pr_rules.py, inlined --------------------------------
+          COOKBOOK_DEPENDENCY_PATTERNS: list[str] = []
+          COOKBOOK_WARNING = (
+              "⚠️ **Cookbook-server compatibility** — this repo depends on the internal cookbook "
+              "client. Verify cookbook version compatibility and check for auto-registered filters "
+              "(e.g. a proxy-header filter) that can silently 404 requests behind the gateway."
+          )
+          DOCKER_MOUNTPOINT_FILES: list[str] = ["Docker.aws.json.erb"]
+          DOCKER_MOUNTPOINT_WARNING = (
+              "⚠️ **Docker/Tomcat mountpoint** — this repo has a `{filename}` config. Confirm its "
+              "Tomcat mountpoint version was bumped to match this upgrade's base image/JDK target — "
+              "a missed mountpoint means Tomcat silently ignores the newer servlet descriptor and "
+              "every URL 404s with no obvious cause."
+          )
+          # --- end inlined rules ----------------------------------------------
+
+          working_dir = "java-service"
+          recipe_slug = "spring-boot-3-0"
+
+          def detect_current_version() -> str:
+              pom = Path(working_dir) / "pom.xml"
+              if not pom.exists():
+                  return "unknown"
+              content = pom.read_text(errors="replace")
+              lines = content.splitlines()
+              found = False
+              for line in lines:
+                  if "spring-boot-starter-parent".lower() in line.lower():
+                      found = True
+                  if found and "<version>" in line:
+                      m = re.search(r"<version>([^<]+)</version>", line)
+                      if m:
+                          return m.group(1).strip()
+              return "unknown"
+
+          def resolve_reviewers() -> tuple[list[str], list[str]]:
+              content = None
+              for candidate in ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS"):
+                  p = Path(candidate)
+                  if p.exists():
+                      content = p.read_text(errors="replace")
+                      break
+              if not content:
+                  return [], []
+              changed_path = f"{working_dir}/pom.xml"
+              matched: list[str] = []
+              for line in content.splitlines():
+                  line = line.strip()
+                  if not line or line.startswith("#"):
+                      continue
+                  parts = line.split()
+                  if len(parts) < 2:
+                      continue
+                  pattern, owners = parts[0], parts[1:]
+                  if pattern == "*":
+                      matched = owners
+                  elif pattern.startswith("*.") and changed_path.endswith(pattern[1:]):
+                      matched = owners
+                  elif changed_path == pattern.lstrip("/") or changed_path.startswith(pattern.lstrip("/").rstrip("/") + "/"):
+                      matched = owners
+              reviewers, team_reviewers = [], []
+              for handle in matched:
+                  h = handle.lstrip("@")
+                  if "/" in h:
+                      team_reviewers.append(h.split("/", 1)[1])
+                  else:
+                      reviewers.append(h)
+              return reviewers, team_reviewers
+
+          def enrichment_body() -> str:
+              notes = []
+              if COOKBOOK_DEPENDENCY_PATTERNS:
+                  pom = Path(working_dir) / "pom.xml"
+                  if pom.exists() and any(p.lower() in pom.read_text(errors="replace").lower() for p in COOKBOOK_DEPENDENCY_PATTERNS):
+                      notes.append(COOKBOOK_WARNING)
+              for filename in DOCKER_MOUNTPOINT_FILES:
+                  if (Path(working_dir) / filename).exists() or Path(filename).exists():
+                      notes.append(DOCKER_MOUNTPOINT_WARNING.format(filename=filename))
+                      break
+              notes.append(
+                  "⚠️ **Trailing-slash matching** — Spring Boot 3 disables trailing-slash URL "
+                  "matching by default. If this service sits behind Mashery (or another gateway "
+                  "that forwards paths with a trailing slash), confirm those forwarded paths still resolve."
+              )
+              notes.append("- [ ] Endpoint-by-endpoint Postman validation through every gateway this service sits behind, before and after — not just \"CI passed\".")
+              return "\n\n".join(notes)
+
+          current_version = detect_current_version()
+          reviewers, team_reviewers = resolve_reviewers()
+          body = enrichment_body()
+
+          import os
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"current_version={current_version}\n")
+              f.write(f"reviewers={','.join(reviewers)}\n")
+              f.write(f"team_reviewers={','.join(team_reviewers)}\n")
+              f.write(f"enrichment_body<<PR_ENRICHMENT_EOF\n{body}\nPR_ENRICHMENT_EOF\n")
+          ENRICH_EOF
+          python3 /tmp/pr_enrichment.py
+
       - name: Open draft PR
         if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
         id: cpr
@@ -96,15 +210,21 @@ jobs:
           token: ${{ secrets.OPENREWRITE_PR_TOKEN }}
           commit-message: "chore(rewrite): apply UpgradeSpringBoot_3_0"
           branch: rewrite/spring-boot-3-0
-          title: "chore: upgrade to Spring Boot 3.0 (OpenRewrite)"
+          title: "chore: upgrade ${{ github.event.repository.name }} Spring Boot ${{ steps.enrichment.outputs.current_version }} -> 3.0.x (OpenRewrite)"
           draft: true
           labels: openrewrite, major-upgrade, dependencies
-          # No reviewers/team-reviewers: this is a personal account (no teams), and the
-          # PR is authored as the same account the OPENREWRITE_PR_TOKEN belongs to —
-          # GitHub rejects requesting a review from the PR's own author.
+          # Resolved from this repo's own real CODEOWNERS (see the enrichment
+          # step above) instead of a REPLACE_WITH_REVIEWER_HANDLE placeholder.
+          # Empty strings here are fine — the action just requests no one,
+          # same as before, e.g. on a personal account with no CODEOWNERS
+          # file and no teams (GitHub also rejects requesting the PR's own
+          # author as a reviewer, which a real CODEOWNERS entry could still
+          # hit — that failure is non-fatal to the PR itself either way).
+          reviewers: ${{ steps.enrichment.outputs.reviewers }}
+          team-reviewers: ${{ steps.enrichment.outputs.team_reviewers }}
           body: |
             Automated via OpenRewrite recipe `org.openrewrite.java.spring.boot3.UpgradeSpringBoot_3_0`.
-            
+
             🛑 Open critical/high Dependabot alerts on this ecosystem right now: ${{ steps.alerts.outputs.critical_high_count }} — this PR may resolve some of them; check the Security tab after merging.
             This recipe pulls in the javax→jakarta migration as a transitive recipe automatically.
 
@@ -115,6 +235,10 @@ jobs:
             - [ ] Checking the uploaded `rewrite-datatables` artifact for a full list of applied changes
 
             Prerequisite: repo should already be on Spring Boot 2.7 (see `openrewrite-spring-boot-2-7.yml`).
+
+            ## 🏢 Enterprise Context
+
+            ${{ steps.enrichment.outputs.enrichment_body }}
 
       - name: Notify Slack (no-op if webhook secret is not set)
         if: steps.existing_pr.outputs.open_pr_count == '0' && steps.diff.outputs.changed == 'true'
